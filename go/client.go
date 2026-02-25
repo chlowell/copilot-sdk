@@ -34,6 +34,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -47,6 +48,49 @@ import (
 	"github.com/github/copilot-sdk/go/internal/jsonrpc2"
 	"github.com/github/copilot-sdk/go/rpc"
 )
+
+const stderrTailLimitBytes = 64 * 1024
+
+type tailBuffer struct {
+	data  []byte
+	limit int
+}
+
+func newTailBuffer(limit int) tailBuffer {
+	if limit < 0 {
+		limit = 0
+	}
+	return tailBuffer{limit: limit}
+}
+
+func (b *tailBuffer) Write(p []byte) (int, error) {
+	written := len(p)
+	if b.limit == 0 || len(p) == 0 {
+		return written, nil
+	}
+
+	if len(p) >= b.limit {
+		b.data = append(b.data[:0], p[len(p)-b.limit:]...)
+		return written, nil
+	}
+
+	if len(b.data)+len(p) > b.limit {
+		overflow := len(b.data) + len(p) - b.limit
+		copy(b.data, b.data[overflow:])
+		b.data = b.data[:len(b.data)-overflow]
+	}
+
+	b.data = append(b.data, p...)
+	return written, nil
+}
+
+func (b *tailBuffer) String() string {
+	return string(b.data)
+}
+
+func (b *tailBuffer) Reset() {
+	b.data = b.data[:0]
+}
 
 // Client manages the connection to the Copilot CLI server and provides session management.
 //
@@ -88,6 +132,8 @@ type Client struct {
 	lifecycleHandlersMux   sync.Mutex
 	processDone            chan struct{} // closed when CLI process exits
 	processError           error         // set before processDone is closed
+	stderrBuffer           tailBuffer    // captures CLI stderr tail for error messages
+	stderrMux              sync.Mutex    // protects stderrBuffer
 
 	// RPC provides typed server-scoped RPC methods.
 	// This field is nil until the client is connected via Start().
@@ -126,6 +172,7 @@ func NewClient(options *ClientOptions) *Client {
 		useStdio:         true,
 		autoStart:        true, // default
 		autoRestart:      true, // default
+		stderrBuffer:     newTailBuffer(stderrTailLimitBytes),
 	}
 
 	if options != nil {
@@ -343,6 +390,8 @@ func (c *Client) Stop() error {
 	c.modelsCache = nil
 	c.modelsCacheMux.Unlock()
 
+	c.resetStderrBuffer()
+
 	c.state = StateDisconnected
 	if !c.isExternalServer {
 		c.actualPort = 0
@@ -402,6 +451,8 @@ func (c *Client) ForceStop() {
 	c.modelsCacheMux.Lock()
 	c.modelsCache = nil
 	c.modelsCacheMux.Unlock()
+
+	c.resetStderrBuffer()
 
 	c.state = StateDisconnected
 	if !c.isExternalServer {
@@ -1015,6 +1066,73 @@ func (c *Client) verifyProtocolVersion(ctx context.Context) error {
 	return nil
 }
 
+// getStderrOutput returns the captured stderr output from the CLI process.
+func (c *Client) getStderrOutput() string {
+	c.stderrMux.Lock()
+	defer c.stderrMux.Unlock()
+	return strings.TrimSpace(c.stderrBuffer.String())
+}
+
+func (c *Client) resetStderrBuffer() {
+	c.stderrMux.Lock()
+	defer c.stderrMux.Unlock()
+	c.stderrBuffer.Reset()
+}
+
+// readStderr reads from the given reader into the client's stderr buffer.
+// This should be called in a goroutine after process start.
+func (c *Client) readStderr(r io.Reader) {
+	buf := make([]byte, 4096)
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			c.stderrMux.Lock()
+			c.stderrBuffer.Write(buf[:n])
+			c.stderrMux.Unlock()
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+func (c *Client) formatProcessExitError(waitErr error) error {
+	stderrOutput := c.getStderrOutput()
+	if stderrOutput != "" {
+		if waitErr != nil {
+			return fmt.Errorf("CLI process exited: %v\nstderr: %s", waitErr, stderrOutput)
+		}
+		return fmt.Errorf("CLI process exited unexpectedly\nstderr: %s", stderrOutput)
+	}
+	if waitErr != nil {
+		return fmt.Errorf("CLI process exited: %v", waitErr)
+	}
+	return fmt.Errorf("CLI process exited unexpectedly")
+}
+
+func (c *Client) withStderrOutput(base string) error {
+	stderrOutput := c.getStderrOutput()
+	if stderrOutput == "" {
+		return errors.New(base)
+	}
+	return fmt.Errorf(base+"\nstderr: %s", stderrOutput)
+}
+
+func (c *Client) startProcessMonitor() chan struct{} {
+	c.processError = nil
+	c.processDone = make(chan struct{})
+	processDone := c.processDone
+	process := c.process
+
+	go func() {
+		waitErr := process.Wait()
+		c.processError = c.formatProcessExitError(waitErr)
+		close(processDone)
+	}()
+
+	return processDone
+}
+
 // startCLIServer starts the CLI server process.
 //
 // This spawns the CLI server as a subprocess using the configured transport
@@ -1092,25 +1210,25 @@ func (c *Client) startCLIServer(ctx context.Context) error {
 			return fmt.Errorf("failed to create stdout pipe: %w", err)
 		}
 
+		stderr, err := c.process.StderrPipe()
+		if err != nil {
+			return fmt.Errorf("failed to create stderr pipe: %w", err)
+		}
+
+		c.resetStderrBuffer()
+
 		if err := c.process.Start(); err != nil {
 			return fmt.Errorf("failed to start CLI server: %w", err)
 		}
 
-		// Monitor process exit to signal pending requests
-		c.processDone = make(chan struct{})
-		go func() {
-			waitErr := c.process.Wait()
-			if waitErr != nil {
-				c.processError = fmt.Errorf("CLI process exited: %v", waitErr)
-			} else {
-				c.processError = fmt.Errorf("CLI process exited unexpectedly")
-			}
-			close(c.processDone)
-		}()
+		// Capture stderr in background
+		go c.readStderr(stderr)
+
+		processDone := c.startProcessMonitor()
 
 		// Create JSON-RPC client immediately
 		c.client = jsonrpc2.NewClient(stdin, stdout)
-		c.client.SetProcessDone(c.processDone, &c.processError)
+		c.client.SetProcessDone(processDone, &c.processError)
 		c.RPC = rpc.NewServerRpc(c.client)
 		c.setupNotificationHandler()
 		c.client.Start()
@@ -1123,31 +1241,71 @@ func (c *Client) startCLIServer(ctx context.Context) error {
 			return fmt.Errorf("failed to create stdout pipe: %w", err)
 		}
 
+		stderr, err := c.process.StderrPipe()
+		if err != nil {
+			return fmt.Errorf("failed to create stderr pipe: %w", err)
+		}
+
+		c.resetStderrBuffer()
+
 		if err := c.process.Start(); err != nil {
 			return fmt.Errorf("failed to start CLI server: %w", err)
 		}
 
+		// Capture stderr in background
+		go c.readStderr(stderr)
+
+		processDone := c.startProcessMonitor()
+
 		// Wait for port announcement
-		scanner := bufio.NewScanner(stdout)
-		timeout := time.After(10 * time.Second)
 		portRegex := regexp.MustCompile(`listening on port (\d+)`)
+		portFound := make(chan int, 1)
+		scanErr := make(chan error, 1)
+
+		go func() {
+			scanner := bufio.NewScanner(stdout)
+			for scanner.Scan() {
+				line := scanner.Text()
+				if matches := portRegex.FindStringSubmatch(line); len(matches) > 1 {
+					port, err := strconv.Atoi(matches[1])
+					if err != nil {
+						scanErr <- fmt.Errorf("failed to parse port: %w", err)
+						return
+					}
+					portFound <- port
+					return
+				}
+			}
+
+			if err := scanner.Err(); err != nil {
+				scanErr <- err
+				return
+			}
+
+			scanErr <- io.EOF
+		}()
+
+		timeout := time.After(10 * time.Second)
 
 		for {
 			select {
 			case <-timeout:
-				return fmt.Errorf("timeout waiting for CLI server to start")
-			default:
-				if scanner.Scan() {
-					line := scanner.Text()
-					if matches := portRegex.FindStringSubmatch(line); len(matches) > 1 {
-						port, err := strconv.Atoi(matches[1])
-						if err != nil {
-							return fmt.Errorf("failed to parse port: %w", err)
-						}
-						c.actualPort = port
-						return nil
+				return c.withStderrOutput("timeout waiting for CLI server to start")
+			case <-processDone:
+				return c.withStderrOutput("CLI process exited before announcing port")
+			case port := <-portFound:
+				c.actualPort = port
+				return nil
+			case err := <-scanErr:
+				if errors.Is(err, io.EOF) {
+					select {
+					case <-processDone:
+						return c.withStderrOutput("CLI process exited before announcing port")
+					default:
+						return c.withStderrOutput("CLI process output ended before announcing port")
 					}
 				}
+				return c.withStderrOutput("failed while reading CLI server startup output: " + err.Error())
 			}
 		}
 	}
@@ -1184,6 +1342,9 @@ func (c *Client) connectViaTcp(ctx context.Context) error {
 
 	// Create JSON-RPC client with the connection
 	c.client = jsonrpc2.NewClient(conn, conn)
+	if c.processDone != nil {
+		c.client.SetProcessDone(c.processDone, &c.processError)
+	}
 	c.RPC = rpc.NewServerRpc(c.client)
 	c.setupNotificationHandler()
 	c.client.Start()

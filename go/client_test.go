@@ -1,11 +1,14 @@
 package copilot
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"strings"
 	"testing"
 )
 
@@ -485,4 +488,78 @@ func TestClient_ResumeSession_RequiresPermissionHandler(t *testing.T) {
 			t.Errorf("Expected error about OnPermissionRequest being required, got: %v", err)
 		}
 	})
+}
+
+func TestClient_StderrCapturedOnCLIExit(t *testing.T) {
+	t.Run("should include stderr in error when CLI process exits unexpectedly", func(t *testing.T) {
+		client := NewClient(&ClientOptions{
+			CLIPath:  os.Args[0],
+			CLIArgs:  []string{"-test.run=TestClient_HelperCLIProcess", "--", "exit-with-stderr"},
+			LogLevel: "info",
+			Env:      append(os.Environ(), "GO_WANT_HELPER_PROCESS=1"),
+		})
+		t.Cleanup(func() { client.ForceStop() })
+
+		err := client.Start(context.Background())
+		if err == nil {
+			t.Fatal("Expected error when CLI exits with error, got nil")
+		}
+
+		errMsg := err.Error()
+		if !strings.Contains(errMsg, "stderr") {
+			t.Errorf("Expected error to contain 'stderr', got: %s", errMsg)
+		}
+		if !strings.Contains(errMsg, "fatal: something went wrong") {
+			t.Errorf("Expected error to contain stderr output 'fatal: something went wrong', got: %s", errMsg)
+		}
+	})
+
+	t.Run("should bound stderr output to tail", func(t *testing.T) {
+		client := NewClient(&ClientOptions{
+			CLIPath:  os.Args[0],
+			CLIArgs:  []string{"-test.run=TestClient_HelperCLIProcess", "--", "exit-with-large-stderr"},
+			LogLevel: "info",
+			Env:      append(os.Environ(), "GO_WANT_HELPER_PROCESS=1"),
+		})
+		t.Cleanup(func() { client.ForceStop() })
+
+		err := client.Start(context.Background())
+		if err == nil {
+			t.Fatal("Expected error when CLI exits with large stderr output, got nil")
+		}
+
+		errMsg := err.Error()
+		if !strings.Contains(errMsg, "TAIL_MARKER") {
+			t.Errorf("Expected error to contain tail marker, got: %s", errMsg)
+		}
+		if strings.Contains(errMsg, "HEAD_MARKER") {
+			t.Errorf("Expected error to exclude head marker from truncated stderr, got: %s", errMsg)
+		}
+	})
+}
+
+func TestClient_HelperCLIProcess(t *testing.T) {
+	if os.Getenv("GO_WANT_HELPER_PROCESS") != "1" {
+		return
+	}
+
+	args := os.Args
+	mode := ""
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] == "--" {
+			mode = args[i+1]
+			break
+		}
+	}
+
+	switch mode {
+	case "exit-with-stderr":
+		fmt.Fprintln(os.Stderr, "fatal: something went wrong")
+		os.Exit(1)
+	case "exit-with-large-stderr":
+		fmt.Fprintln(os.Stderr, "HEAD_MARKER"+strings.Repeat("x", 100000)+"TAIL_MARKER")
+		os.Exit(1)
+	default:
+		os.Exit(2)
+	}
 }
